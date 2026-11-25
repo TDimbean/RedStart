@@ -1,0 +1,18 @@
+[package]
+name = "redstart"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_SystemInformation"] }
+
+[build-dependencies]
+winres = "0.1"
