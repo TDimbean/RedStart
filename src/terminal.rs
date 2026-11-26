@@ -1,10 +1,11 @@
 use std::{io::{self, Write}, time::Duration};
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Key { Up, Down, Left, Right, Enter, Esc, Backspace, Delete, Char(char) }
+pub enum Key { Up, Down, Left, Right, Enter, Esc, CtrlC, Tab, F2, Backspace, Delete, #[cfg(windows)] Other, Char(char) }
 
 pub struct Terminal {
     old_lines: Vec<String>,
+    alternate_screen: bool,
     #[cfg(unix)] old_mode: libc::termios,
     #[cfg(windows)] input_mode: u32,
     #[cfg(windows)] output_mode: u32,
@@ -12,6 +13,14 @@ pub struct Terminal {
 
 impl Terminal {
     pub fn new() -> io::Result<Self> {
+        Self::open(true)
+    }
+
+    pub fn new_inline() -> io::Result<Self> {
+        Self::open(false)
+    }
+
+    fn open(alternate_screen: bool) -> io::Result<Self> {
         #[cfg(unix)] let old_mode = unsafe {
             let mut old: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(0, &mut old) != 0 { return Err(io::Error::last_os_error()); }
@@ -36,9 +45,11 @@ impl Terminal {
             }
             (old_input, old_output)
         };
-        print!("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
-        io::stdout().flush()?;
-        Ok(Self { old_lines: Vec::new(), #[cfg(unix)] old_mode, #[cfg(windows)] input_mode, #[cfg(windows)] output_mode })
+        if alternate_screen {
+            print!("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+            io::stdout().flush()?;
+        }
+        Ok(Self { old_lines: Vec::new(), alternate_screen, #[cfg(unix)] old_mode, #[cfg(windows)] input_mode, #[cfg(windows)] output_mode })
     }
 
     pub fn draw(&mut self, lines: &[String]) -> io::Result<()> {
@@ -85,8 +96,10 @@ impl Drop for Terminal {
             SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), self.input_mode);
             SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), self.output_mode);
         }
-        print!("\x1b[?25h\x1b[?1049l");
-        let _ = io::stdout().flush();
+        if self.alternate_screen {
+            print!("\x1b[?25h\x1b[?1049l");
+            let _ = io::stdout().flush();
+        }
     }
 }
 
@@ -111,17 +124,27 @@ pub fn read_key(timeout: Duration) -> io::Result<Option<Key>> {
     let Some(first) = byte(timeout)? else { return Ok(None); };
     Ok(Some(match first {
         b'\r' | b'\n' => Key::Enter,
+        b'\t' => Key::Tab,
         8 | 127 => Key::Backspace,
-        3 => Key::Esc,
-        27 => {
-            if byte(Duration::from_millis(30))? != Some(b'[') { return Ok(Some(Key::Esc)); }
-            match byte(Duration::from_millis(30))? {
-                Some(b'A') => Key::Up, Some(b'B') => Key::Down,
-                Some(b'C') => Key::Right, Some(b'D') => Key::Left,
-                Some(b'3') => { let _ = byte(Duration::from_millis(30))?; Key::Delete },
-                _ => Key::Esc,
+        3 => Key::CtrlC,
+        27 => match byte(Duration::from_millis(50))? {
+            Some(b'[') => {
+                let mut sequence = Vec::new();
+                for _ in 0..8 {
+                    let Some(next) = byte(Duration::from_millis(50))? else { break; };
+                    sequence.push(next);
+                    if next.is_ascii_alphabetic() || next == b'~' { break; }
+                }
+                match sequence.as_slice() {
+                    b"A" => Key::Up, b"B" => Key::Down,
+                    b"C" => Key::Right, b"D" => Key::Left,
+                    b"3~" => Key::Delete, b"12~" => Key::F2,
+                    _ => Key::Esc,
+                }
             }
-        }
+            Some(b'O') => match byte(Duration::from_millis(50))? { Some(b'Q') => Key::F2, _ => Key::Esc },
+            _ => Key::Esc,
+        },
         b if b < 128 => Key::Char(b as char),
         b => {
             let size = if b & 0xe0 == 0xc0 { 2 } else if b & 0xf0 == 0xe0 { 3 } else if b & 0xf8 == 0xf0 { 4 } else { return Ok(None) };
@@ -152,10 +175,11 @@ pub fn read_key(timeout: Duration) -> io::Result<Option<Key>> {
             0x26 => Some(Key::Up), 0x28 => Some(Key::Down),
             0x25 => Some(Key::Left), 0x27 => Some(Key::Right),
             0x0d => Some(Key::Enter), 0x1b => Some(Key::Esc),
+            0x09 => Some(Key::Tab), 0x71 => Some(Key::F2),
             0x08 => Some(Key::Backspace), 0x2e => Some(Key::Delete),
             _ => {
                 let code = unsafe { event.uChar.UnicodeChar } as u32;
-                if code == 3 { Some(Key::Esc) } else { char::from_u32(code).filter(|c| !c.is_control()).map(Key::Char) }
+                if code == 3 { Some(Key::CtrlC) } else { Some(char::from_u32(code).filter(|c| !c.is_control()).map_or(Key::Other, Key::Char)) }
             }
         };
         if key.is_some() { return Ok(key); }
